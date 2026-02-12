@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Creates an SNS Topic with email subscription, a Lambda function that formats GuardDuty
+  findings and publishes to that SNS topic, and a least-privilege IAM role.
+
+Parameters:
+  AlertEmailAddress:
+    Type: String
+    Description: Email address that will receive GuardDuty alert notifications
+    AllowedPattern: '^[_a-z0-9-]+(\.[_a-z0-9-]+)*@[a-z0-9-]+(\.[a-z0-9-]+)*(\.[a-z]{2,4})$'
+    ConstraintDescription: Must be a valid email address
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # SNS Topic for GuardDuty alerts
+  # ---------------------------------------------------------------------------
+  GuardDutyAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub GuardDuty-Alerts-${AWS::StackName}
+      DisplayName: GuardDuty Alert Notifications
+      Tags:
+        - Key: Purpose
+          Value: GuardDuty alerting
+
+  GuardDutyEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref GuardDutyAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmailAddress
+
+  # ---------------------------------------------------------------------------
+  # IAM Role for Lambda - with basic execution + sns:Publish to our topic only
+  # ---------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub GuardDutyAlertLambdaRole-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PublishToGuardDutyTopic
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref GuardDutyAlertsTopic
+      Tags:
+        - Key: Purpose
+          Value: GuardDuty alerting
+
+  # ---------------------------------------------------------------------------
+  # Lambda Function - processes GuardDuty findings
+  # ---------------------------------------------------------------------------
+  GuardDutyAlertLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub GuardDuty-AlertNotifier-${AWS::StackName}
+      Description: Formats GuardDuty Trojan/DoS findings and sends to SNS
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      MemorySize: 128
+      Timeout: 30
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref GuardDutyAlertsTopic
+
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime
+
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              try:
+                  detail = event["detail"]
+                  instance_id = detail["resource"]["instanceDetails"]["instanceId"]
+                  public_ip = detail["resource"]["instanceDetails"]["networkInterfaces"][0]["publicIp"]
+                  finding_type = detail["type"]
+                  region = detail["region"]
+                  description = detail["description"]
+                  time = detail["service"]["eventFirstSeen"]
+                  profile = detail["resource"]["instanceDetails"]["iamInstanceProfile"]["arn"]
+                  remote_ip = detail["service"]["action"]["networkConnectionAction"]["remoteIpDetails"]["ipAddressV4"]
+                  remote_port = detail["service"]["action"]["networkConnectionAction"]["remotePortDetails"]["port"]
+                  
+                  readable_message = f"""
+          🚨 GuardDuty Alert: Trojan Activity Detected
+
+          🔍 Type: {finding_type}
+          💡 Description: {description}
+
+          🖥 Instance ID: {instance_id}
+          🔐 Instance Profile: {profile}
+          🌐 Public IP: {public_ip}
+          ➡️ Remote IP: {remote_ip}:{remote_port}
+          📍 Region: {region}
+          🕒 Time: {datetime.strptime(time, "%Y-%m-%dT%H:%M:%S.%fZ").strftime('%Y-%m-%d %H:%M:%S')} UTC
+
+          🧠 Recommendation:
+          Isolate or stop the EC2 instance and investigate for malware or unauthorized traffic.
+          """
+
+                  sns.publish(
+                      TopicArn=os.environ["SNS_TOPIC_ARN"],
+                      Subject="🚨 GuardDuty: Backdoor:EC2/DenialOfService.Tcp Detected",
+                      Message=readable_message
+                  )
+
+                  return {
+                      'statusCode': 200,
+                      'body': f"Formatted alert sent to SNS topic for instance {instance_id}"
+                  }
+
+              except Exception as e:
+                  print("Error:", str(e))
+                  return {
+                      'statusCode': 500,
+                      'body': f"Error processing event: {str(e)}"
+                  }
+
+      Tags:
+        - Key: Purpose
+          Value: GuardDuty alerting
+
+Outputs:
+  SnsTopicArn:
+    Description: ARN of the SNS topic that receives GuardDuty alerts
+    Value: !Ref GuardDutyAlertsTopic
+
+  SnsTopicName:
+    Description: Name of the SNS topic
+    Value: !GetAtt GuardDutyAlertsTopic.TopicName
+
+  LambdaFunctionName:
+    Description: Name of the created Lambda function
+    Value: !Ref GuardDutyAlertLambda
+
+  LambdaFunctionArn:
+    Description: ARN of the created Lambda function
+    Value: !GetAtt GuardDutyAlertLambda.Arn
+
+  ExecutionRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
+
+  SubscriptionEmail:
+    Description: Email address subscribed to receive alerts
+    Value: !Ref AlertEmailAddress
